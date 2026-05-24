@@ -1,0 +1,301 @@
+{% extends "base.html" %}
+{% block title %}Отчёт — {{ report['ticker'] }}{% endblock %}
+
+{% block content %}
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+    <h1>Отчёт #{{ report['id'] }}</h1>
+    <div style="display:flex;gap:8px">
+        <button type="button" class="btn btn-outline" onclick="copyReport()">📋 Копировать</button>
+        <a href="/report/{{ report['id'] }}/download" class="btn btn-outline">⬇ .txt</a>
+        {% if report['report_json'] %}
+        <a href="/report/{{ report['id'] }}/download_json" class="btn btn-outline">⬇ .json</a>
+        {% endif %}
+        <a href="/history" class="btn btn-outline">Назад к истории</a>
+    </div>
+</div>
+
+<script>
+function copyReport() {
+    const el = document.querySelector('.report-text');
+    if (!el) return;
+    const text = el.innerText || el.textContent;
+    navigator.clipboard.writeText(text).then(() => {
+        const btns = document.querySelectorAll('button');
+        for (const b of btns) {
+            if (b.textContent.includes('Копировать')) {
+                const old = b.textContent;
+                b.textContent = '✓ Скопировано';
+                setTimeout(() => { b.textContent = old; }, 1500);
+                break;
+            }
+        }
+    }).catch(err => alert('Ошибка копирования: ' + err));
+}
+</script>
+
+<div class="card">
+    <div class="meta-row">
+        <div class="meta-item">Тикер: <span>{{ report['ticker'] or '—' }}</span></div>
+        <div class="meta-item">Биржа: <span>{{ report['exchange'] or '—' }}</span></div>
+        <div class="meta-item">ТФ: <span>{{ report['timeframe'] or '—' }}</span></div>
+        <div class="meta-item">Цена: <span>{{ report['price'] }}</span></div>
+    </div>
+    <div class="meta-row">
+        <div class="meta-item">Тип: <span>{{ report['analysis_type'] or '—' }}</span></div>
+        <div class="meta-item">AI: <span>{{ report['ai_provider'] or '—' }}</span></div>
+        <div class="meta-item">Баров: <span>{{ report['n_bars'] }}</span></div>
+        <div class="meta-item">Время: <span>{{ '%.1f'|format(report['elapsed_sec']) }}с</span></div>
+        <div class="meta-item">Дата: <span>{{ report['created_at'] }}</span></div>
+    </div>
+</div>
+
+<div class="card">
+    <h2>Результат анализа</h2>
+    <div class="report-text">{{ report['report_text'] }}</div>
+</div>
+
+{% if 'Вывод ИИ' not in (report['analysis_type'] or '') and 'ФОМО' not in (report['analysis_type'] or '') %}
+<div class="card">
+    <h2>🧠 Вывод ИИ (анализ по данным препроцессора)</h2>
+    <p style="color:#8b949e;margin-bottom:12px">
+        AI проанализирует все 18 разделов и построит прогноз: абзац ≥300 слов + 6 буллитов по регламенту.
+    </p>
+    <form action="/ai_conclusion/{{ report['id'] }}" method="post" id="aiConclusionForm">
+        <div style="display:flex;gap:16px;margin-bottom:12px">
+            <div>
+                <label for="ai_conc_provider">AI Провайдер</label>
+                <select name="provider" id="ai_conc_provider"></select>
+            </div>
+            <div>
+                <label for="ai_conc_model">Модель</label>
+                <select name="model" id="ai_conc_model"></select>
+            </div>
+        </div>
+        <div>
+            <button type="submit" class="btn btn-primary" id="aiConcBtn">
+                <span id="aiConcBtnText">🧠 Сгенерировать вывод ИИ</span>
+                <span id="aiConcBtnSpinner" style="display:none">⏳ Генерация...</span>
+            </button>
+        </div>
+    </form>
+    <div id="aiConcProgress" style="display:none;margin-top:16px">
+        <div style="display:flex;align-items:center;gap:8px">
+            <span id="aiConcStatus" style="color:#8b949e;font-size:14px">AI генерирует текст...</span>
+        </div>
+        <div style="background:#21262d;border-radius:4px;height:6px;margin-top:8px">
+            <div id="aiConcBar" style="background:linear-gradient(90deg,#58a6ff,#3fb950);height:100%;width:0%;transition:width 0.5s ease;border-radius:4px"></div>
+        </div>
+        <div id="aiConcTimer" style="color:#484f58;font-size:12px;margin-top:4px">0 сек</div>
+    </div>
+    <div id="aiConcError" style="display:none;margin-top:12px;padding:12px;background:#3d1418;border:1px solid #f85149;border-radius:6px;color:#f85149"></div>
+</div>
+
+<script>
+(function() {
+    const provSel = document.getElementById('ai_conc_provider');
+    const modSel  = document.getElementById('ai_conc_model');
+    const providers = {{ providers_json|safe }};
+    Object.entries(providers).forEach(([id, p]) => {
+        const opt = document.createElement('option');
+        opt.value = id; opt.textContent = p.name;
+        if (id === '{{ default_provider }}') opt.selected = true;
+        provSel.appendChild(opt);
+    });
+    function updateModels() {
+        modSel.innerHTML = '';
+        const p = providers[provSel.value];
+        if (p && p.models) p.models.forEach(m => {
+            const o = document.createElement('option'); o.value = m.id; o.textContent = m.name;
+            if (m.default) o.selected = true; modSel.appendChild(o);
+        });
+    }
+    provSel.addEventListener('change', updateModels);
+    updateModels();
+
+    const form = document.getElementById('aiConclusionForm');
+    form.addEventListener('submit', function(e) {
+        e.preventDefault();
+        const btn = document.getElementById('aiConcBtn');
+        const progress = document.getElementById('aiConcProgress');
+        const bar = document.getElementById('aiConcBar');
+        const status = document.getElementById('aiConcStatus');
+        const timer = document.getElementById('aiConcTimer');
+        const errorDiv = document.getElementById('aiConcError');
+        btn.disabled = true;
+        document.getElementById('aiConcBtnText').style.display = 'none';
+        document.getElementById('aiConcBtnSpinner').style.display = 'inline';
+        progress.style.display = 'block';
+        errorDiv.style.display = 'none';
+        let seconds = 0;
+        const timerInterval = setInterval(() => { seconds++; timer.textContent = seconds + ' сек'; bar.style.width = Math.min(95, seconds * 1.5) + '%'; }, 1000);
+        fetch(form.action, { method: 'POST', headers: {'X-Requested-With': 'XMLHttpRequest'}, body: new FormData(form) })
+        .then(r => r.json())
+        .then(d => { clearInterval(timerInterval); bar.style.width = '100%'; if (d.ok) { status.textContent = 'Готово!'; setTimeout(() => window.location.href = d.redirect, 500); } else { errorDiv.textContent = d.error; errorDiv.style.display = 'block'; btn.disabled = false; document.getElementById('aiConcBtnText').style.display = 'inline'; document.getElementById('aiConcBtnSpinner').style.display = 'none'; } })
+        .catch(err => { clearInterval(timerInterval); errorDiv.textContent = 'Ошибка: ' + err.message; errorDiv.style.display = 'block'; btn.disabled = false; document.getElementById('aiConcBtnText').style.display = 'inline'; document.getElementById('aiConcBtnSpinner').style.display = 'none'; });
+    });
+})();
+</script>
+{% endif %}
+
+{% if 'ФОМО' not in (report['analysis_type'] or '') %}
+<div class="card">
+    <h2>🔥 Сделать ФОМО (публикация для Telegram)</h2>
+    <p style="color:#8b949e;font-size:13px;margin-bottom:12px">
+        AI перепишет анализ в формат ФОМО: абзац ~300 слов простым языком + 6 буллитов + блок подписок.
+    </p>
+    <form action="/fomo/{{ report['id'] }}" method="post" id="fomoForm">
+        <div class="row">
+            <div>
+                <label for="fomo_provider">AI Провайдер</label>
+                <select name="provider" id="fomo_provider"></select>
+            </div>
+            <div>
+                <label for="fomo_model">Модель</label>
+                <select name="model" id="fomo_model"></select>
+            </div>
+        </div>
+        <div style="margin-top:16px">
+            <button type="submit" class="btn btn-primary" id="fomoBtn">
+                <span id="fomoBtnText">🔥 Сгенерировать ФОМО</span>
+                <span id="fomoBtnSpinner" style="display:none">⏳ Генерация...</span>
+            </button>
+        </div>
+    </form>
+    <!-- Прогресс-бар ФОМО -->
+    <div id="fomoProgress" style="display:none;margin-top:16px">
+        <div style="display:flex;align-items:center;gap:12px;margin-bottom:8px">
+            <div class="spinner" style="width:18px;height:18px;border:2px solid #30363d;border-top-color:#58a6ff;border-radius:50%;animation:spin 0.8s linear infinite"></div>
+            <span id="fomoStatus" style="color:#8b949e;font-size:14px">Отправка запроса к AI модели...</span>
+        </div>
+        <div style="background:#21262d;border-radius:4px;overflow:hidden;height:6px">
+            <div id="fomoBar" style="background:linear-gradient(90deg,#58a6ff,#3fb950);height:100%;width:0%;transition:width 0.5s ease;border-radius:4px"></div>
+        </div>
+        <div id="fomoTimer" style="color:#484f58;font-size:12px;margin-top:4px">0 сек</div>
+    </div>
+    <div id="fomoError" style="display:none;margin-top:12px;padding:12px;background:#3d1418;border:1px solid #f85149;border-radius:6px;color:#f85149"></div>
+    <style>@keyframes spin{to{transform:rotate(360deg)}}</style>
+    <script>
+    (function(){
+        let providersData = {};
+        const provSel = document.getElementById('fomo_provider');
+        const modSel  = document.getElementById('fomo_model');
+
+        function fillModels(pid) {
+            modSel.innerHTML = '';
+            const prov = providersData[pid];
+            if (!prov) return;
+            (prov.models || []).forEach(function(m){
+                const opt = document.createElement('option');
+                opt.value = m.id;
+                opt.textContent = m.name;
+                if (m.id === prov.default_model) opt.selected = true;
+                modSel.appendChild(opt);
+            });
+        }
+
+        provSel.addEventListener('change', function(){ fillModels(this.value); });
+
+        fetch('/api/providers')
+            .then(r => r.json())
+            .then(function(data){
+                providersData = data;
+                provSel.innerHTML = '';
+                for (const [pid, prov] of Object.entries(data)) {
+                    const opt = document.createElement('option');
+                    opt.value = pid;
+                    opt.textContent = prov.name + (prov.has_key ? '' : ' ⚠ нет ключа');
+                    provSel.appendChild(opt);
+                }
+                fillModels(provSel.value);
+            });
+
+        // AJAX submit с прогресс-баром
+        const form = document.getElementById('fomoForm');
+        form.addEventListener('submit', function(e) {
+            e.preventDefault();
+            const btn = document.getElementById('fomoBtn');
+            const progress = document.getElementById('fomoProgress');
+            const bar = document.getElementById('fomoBar');
+            const status = document.getElementById('fomoStatus');
+            const timer = document.getElementById('fomoTimer');
+            const errorDiv = document.getElementById('fomoError');
+
+            btn.disabled = true;
+            document.getElementById('fomoBtnText').style.display = 'none';
+            document.getElementById('fomoBtnSpinner').style.display = 'inline';
+            progress.style.display = 'block';
+            errorDiv.style.display = 'none';
+
+            const phases = [
+                {pct: 10, text: 'Подготовка данных экспертов...', sec: 2},
+                {pct: 25, text: 'Извлечение вердиктов из 18 разделов...', sec: 4},
+                {pct: 40, text: 'Формирование промта для AI...', sec: 6},
+                {pct: 55, text: 'Ожидание ответа AI модели...', sec: 10},
+                {pct: 70, text: 'AI генерирует текст...', sec: 20},
+                {pct: 85, text: 'AI дописывает маршрут и буллиты...', sec: 35},
+                {pct: 92, text: 'Почти готово...', sec: 50},
+            ];
+
+            let startTime = Date.now();
+            let timerInterval = setInterval(function(){
+                let elapsed = Math.floor((Date.now() - startTime) / 1000);
+                timer.textContent = elapsed + ' сек';
+            }, 1000);
+
+            let phaseIdx = 0;
+            let phaseInterval = setInterval(function(){
+                if (phaseIdx < phases.length) {
+                    let elapsed = (Date.now() - startTime) / 1000;
+                    if (elapsed >= phases[phaseIdx].sec) {
+                        bar.style.width = phases[phaseIdx].pct + '%';
+                        status.textContent = phases[phaseIdx].text;
+                        phaseIdx++;
+                    }
+                }
+            }, 500);
+
+            const formData = new FormData(form);
+
+            fetch(form.action, {
+                method: 'POST',
+                body: formData,
+                headers: {'X-Requested-With': 'XMLHttpRequest'},
+            })
+            .then(function(resp) {
+                clearInterval(phaseInterval);
+                clearInterval(timerInterval);
+                if (resp.ok) return resp.json();
+                return resp.text().then(t => { throw new Error(t); });
+            })
+            .then(function(data) {
+                bar.style.width = '100%';
+                status.textContent = '✅ Готово! Переход к отчёту...';
+                setTimeout(function(){
+                    window.location.href = data.redirect || '/history';
+                }, 500);
+            })
+            .catch(function(err) {
+                clearInterval(phaseInterval);
+                clearInterval(timerInterval);
+                bar.style.width = '100%';
+                bar.style.background = '#f85149';
+                status.textContent = '❌ Ошибка';
+                errorDiv.style.display = 'block';
+                errorDiv.textContent = 'Ошибка ФОМО: ' + err.message;
+                btn.disabled = false;
+                document.getElementById('fomoBtnText').style.display = 'inline';
+                document.getElementById('fomoBtnSpinner').style.display = 'none';
+            });
+        });
+    })();
+    </script>
+</div>
+{% endif %}
+
+{% if report['report_json'] %}
+<details class="card" style="cursor:pointer">
+    <summary><h2 style="display:inline">JSON данные препроцессора</h2></summary>
+    <pre class="report-text" style="margin-top:12px;max-height:600px;overflow-y:auto">{{ report['report_json'] }}</pre>
+</details>
+{% endif %}
+{% endblock %}

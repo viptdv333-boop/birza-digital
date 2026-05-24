@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.pyo
+*.db
+*.log
+.env
+.claude/
+server.log
+_debug_*.py
+test_output.json
+cnyrub_output.json
+cnyrub_report.txt
+smoke_v8_out.txt
+smoke_v81_full.txt

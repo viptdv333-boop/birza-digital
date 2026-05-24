@@ -1,0 +1,54 @@
+{% extends "base.html" %}
+{% block title %}История отчётов{% endblock %}
+
+{% block content %}
+<h1>История отчётов</h1>
+
+{% if reports %}
+<div class="card" style="padding:0;overflow-x:auto">
+    <table>
+        <thead>
+            <tr>
+                <th>#</th>
+                <th>Дата</th>
+                <th>Тикер</th>
+                <th>Биржа</th>
+                <th>ТФ</th>
+                <th>Тип</th>
+                <th>AI</th>
+                <th>Цена</th>
+                <th>Баров</th>
+                <th>Время</th>
+                <th></th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for r in reports %}
+            <tr>
+                <td><a href="/report/{{ r['id'] }}" style="color:#58a6ff">{{ r['id'] }}</a></td>
+                <td>{{ r['created_at'][:16] }}</td>
+                <td><strong>{{ r['ticker'] or '—' }}</strong></td>
+                <td>{{ r['exchange'] or '—' }}</td>
+                <td><span class="badge badge-blue">{{ r['timeframe'] or '—' }}</span></td>
+                <td>{{ r['analysis_type'] or '—' }}</td>
+                <td>{{ r['ai_provider'] or '—' }}</td>
+                <td>{{ r['price'] }}</td>
+                <td>{{ r['n_bars'] }}</td>
+                <td>{{ '%.1f'|format(r['elapsed_sec']) }}с</td>
+                <td>
+                    <form action="/delete/{{ r['id'] }}" method="post" style="display:inline"
+                          onsubmit="return confirm('Удалить отчёт #{{ r['id'] }}?')">
+                        <button type="submit" class="btn btn-danger">Удалить</button>
+                    </form>
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% else %}
+<div class="card">
+    <p style="color:#8b949e">Отчётов пока нет. <a href="/" style="color:#58a6ff">Запустить анализ</a></p>
+</div>
+{% endif %}
+{% endblock %}

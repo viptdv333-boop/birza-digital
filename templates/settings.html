@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% block title %}Настройки — API ключи{% endblock %}
+
+{% block content %}
+<h1>Настройки API ключей</h1>
+
+<form action="/settings/save" method="post">
+    {% for pid, p in providers.items() %}
+    <div class="card">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+            <h2 style="margin:0">{{ p.name }}</h2>
+            {% if p.has_key %}
+            <span class="badge badge-green">Ключ установлен</span>
+            {% else %}
+            <span class="badge" style="background:#3d1a1a;color:#f85149">Нет ключа</span>
+            {% endif %}
+        </div>
+
+        <label for="key_{{ pid }}">{{ env_keys.get(providers[pid].env_key, '')|length > 0 and 'Обновить ключ' or 'API ключ' }} ({{ providers[pid].env_key }})</label>
+        <input type="password" name="key_{{ pid }}" id="key_{{ pid }}"
+               placeholder="{% if p.has_key %}••••••••••{% else %}Вставьте ключ...{% endif %}"
+               style="width:100%;padding:10px 12px;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#c9d1d9;font-size:14px;font-family:monospace">
+
+        <div style="margin-top:8px;font-size:12px;color:#484f58">
+            Модели: {{ p.models|map(attribute='name')|join(', ') }}
+        </div>
+    </div>
+    {% endfor %}
+
+    <div style="margin-top:8px">
+        <button type="submit" class="btn btn-primary">Сохранить ключи</button>
+    </div>
+
+    <div class="card" style="margin-top:24px;border-color:#21262d">
+        <h2 style="color:#8b949e">Где хранятся ключи</h2>
+        <p style="font-size:13px;color:#8b949e;line-height:1.6">
+            Ключи сохраняются в файл <code style="background:#0d1117;padding:2px 6px;border-radius:4px">Z:\birza_digital\.env</code><br>
+            Также можно установить через переменные окружения (приоритет выше .env).
+        </p>
+    </div>
+</form>
+{% endblock %}

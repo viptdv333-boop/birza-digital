@@ -1,0 +1,281 @@
+{% extends "base.html" %}
+{% block title %}Биржа-цифровой — Анализ{% endblock %}
+
+{% block content %}
+<h1>Новый анализ</h1>
+
+<form id="analysisForm" class="card" enctype="multipart/form-data">
+    <label for="csv_file">CSV файл(ы) — один ТФ или несколько ТФ одного тикера</label>
+    <input type="file" name="csv_file" id="csv_file" accept=".csv" multiple required>
+    <p id="fileHint" style="font-size:12px;color:#8b949e;margin-top:4px">
+        Удерживайте Ctrl/Shift для выбора нескольких файлов. При загрузке 2+ файлов включается
+        <b style="color:#58a6ff">сводный мульти-ТФ анализ по системе Элдера</b>.
+    </p>
+
+    <div class="row">
+        <div>
+            <p style="font-size:13px;color:#58a6ff;margin-top:16px">
+                ℹ️ Тип анализа и горизонт прогноза определяются автоматически по таймфрейму CSV
+            </p>
+        </div>
+        <div>
+            <label style="margin-top:16px">&nbsp;</label>
+            <div class="checkbox-row">
+                <input type="checkbox" name="skip_ai" id="skip_ai" value="1" checked>
+                <label for="skip_ai" style="margin-bottom:0">Только препроцессор (без AI) — ФОМО доступно после анализа</label>
+            </div>
+        </div>
+    </div>
+
+    <!-- AI Provider & Model -->
+    <div id="aiSection">
+        <div class="row" style="margin-top:8px">
+            <div>
+                <label for="provider">AI Провайдер</label>
+                <select name="provider" id="provider">
+                    {% for pid, p in providers.items() %}
+                    <option value="{{ pid }}" {% if pid == default_provider %}selected{% endif %}
+                            data-has-key="{{ 'true' if p.has_key else 'false' }}">
+                        {{ p.name }}{% if p.has_key %} ✓{% else %} (нет ключа){% endif %}
+                    </option>
+                    {% endfor %}
+                </select>
+            </div>
+            <div>
+                <label for="model">Модель</label>
+                <select name="model" id="model"></select>
+            </div>
+        </div>
+        <div id="noKeyWarning" class="flash flash-error" style="display:none;margin-top:12px">
+            API ключ не настроен для этого провайдера. <a href="/settings" style="color:#f85149;text-decoration:underline">Настроить</a>
+        </div>
+    </div>
+
+    <div id="modeIndicator" style="margin-top:16px;padding:10px 14px;border-radius:6px;background:#21262d;border-left:3px solid #58a6ff;font-size:13px">
+        Режим: <b id="modeLabel">Одиночный анализ</b>
+        <span id="modeDetail" style="color:#8b949e"></span>
+    </div>
+
+    <div style="margin-top:20px">
+        <button type="submit" class="btn btn-primary" id="runBtn">
+            <span class="btn-text">Запустить анализ</span>
+            <span class="spinner"></span>
+        </button>
+    </div>
+</form>
+
+<!-- Прогресс -->
+<div id="progressContainer" style="display:none">
+    <h2 style="margin-top:24px">Прогресс</h2>
+    <div id="progressList"></div>
+</div>
+
+<template id="progressItemTpl">
+    <div class="card progress-item" style="margin-bottom:12px">
+        <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:8px">
+            <h3 class="progress-title" style="margin:0;font-size:15px"></h3>
+            <span class="progress-pct" style="font-size:18px;font-weight:700;color:#58a6ff">0%</span>
+        </div>
+        <div class="progress-bar" style="height:8px;border-radius:4px">
+            <div class="progress-fill" style="height:100%;border-radius:4px;transition:width 0.3s"></div>
+        </div>
+        <div style="display:flex;justify-content:space-between;margin-top:6px">
+            <p class="progress-message" style="font-size:12px;color:#8b949e;margin:0"></p>
+            <p class="progress-step" style="font-size:11px;color:#484f58;margin:0"></p>
+        </div>
+    </div>
+</template>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const providersData = {{ providers | tojson }};
+
+const providerSelect  = document.getElementById('provider');
+const modelSelect     = document.getElementById('model');
+const skipAI          = document.getElementById('skip_ai');
+const aiSection       = document.getElementById('aiSection');
+const noKeyWarning    = document.getElementById('noKeyWarning');
+const form            = document.getElementById('analysisForm');
+const btn             = document.getElementById('runBtn');
+const progressContainer = document.getElementById('progressContainer');
+const progressList    = document.getElementById('progressList');
+const progressItemTpl = document.getElementById('progressItemTpl');
+const fileInput       = document.getElementById('csv_file');
+const analysisSelect  = null;  // убран — тип определяется автоматически
+const analysisHint    = null;
+const modeLabel       = document.getElementById('modeLabel');
+const modeDetail      = document.getElementById('modeDetail');
+
+function updateModels() {
+    const pid = providerSelect.value;
+    const prov = providersData[pid];
+    modelSelect.innerHTML = '';
+    if (prov && prov.models) {
+        prov.models.forEach(m => {
+            const opt = document.createElement('option');
+            opt.value = m.id;
+            opt.textContent = m.name;
+            if (m.id === prov.default_model) opt.selected = true;
+            modelSelect.appendChild(opt);
+        });
+    }
+    noKeyWarning.style.display = (prov && !prov.has_key) ? 'block' : 'none';
+}
+
+function toggleAI() {
+    aiSection.style.display = skipAI.checked ? 'none' : 'block';
+}
+
+function updateAnalysisHint() {
+    // Тип определяется автоматически — ничего не делаем
+    updateMode();
+}
+
+function updateMode() {
+    const nFiles = fileInput.files.length;
+    const expectedTfs = [];
+    const horizon = 'авто';
+
+    if (nFiles === 0) {
+        modeLabel.textContent = 'Файлы не выбраны';
+        modeDetail.textContent = '';
+    } else if (nFiles === 1) {
+        modeLabel.textContent = 'Одиночный анализ';
+        modeDetail.textContent = ` (${fileInput.files[0].name}) — горизонт ${horizon}`;
+    } else {
+        modeLabel.textContent = `🎯 Сводный мульти-ТФ анализ по Элдеру (${nFiles} файлов)`;
+        const fnames = Array.from(fileInput.files).map(f => f.name).join(', ');
+        modeDetail.innerHTML = `<br>Файлы: ${fnames}<br>Ожидаемые ТФ для «${opt.textContent.split('—')[0].trim()}»: ${expectedTfs.join(', ')}`;
+    }
+}
+
+providerSelect.addEventListener('change', updateModels);
+skipAI.addEventListener('change', toggleAI);
+fileInput.addEventListener('change', updateMode);
+
+updateModels();
+toggleAI();
+
+function createProgressItem(filename) {
+    const node = progressItemTpl.content.cloneNode(true);
+    const item = node.querySelector('.progress-item');
+    item.querySelector('.progress-title').textContent = filename;
+    progressList.appendChild(node);
+    return item;
+}
+
+function setProgressItem(item, data, opts = {}) {
+    const pct = data.total > 0 ? Math.round(data.step / data.total * 100) : 0;
+    const fill = item.querySelector('.progress-fill');
+    const pctEl = item.querySelector('.progress-pct');
+    const msg = item.querySelector('.progress-message');
+    const stepEl = item.querySelector('.progress-step');
+
+    fill.style.width = pct + '%';
+    pctEl.textContent = pct + '%';
+    msg.textContent = data.message || '';
+    stepEl.textContent = 'Шаг ' + data.step + ' / ' + data.total;
+
+    if (data.status === 'done') {
+        pctEl.textContent = '100%';
+        pctEl.style.color = '#3fb950';
+        fill.style.width = '100%';
+        fill.style.background = '#3fb950';
+        stepEl.textContent = '';
+        if (data.report_id) {
+            const url = '/report/' + data.report_id;
+            // Автоматический переход на отчёт
+            window.location.href = url;
+        }
+    } else if (data.status === 'error') {
+        pctEl.textContent = '';
+        fill.style.background = '#f85149';
+        msg.textContent = data.error || 'Неизвестная ошибка';
+        stepEl.textContent = '';
+    }
+}
+
+function pollProgress(taskId, item) {
+    return new Promise((resolve) => {
+        const interval = setInterval(async () => {
+            try {
+                const resp = await fetch('/progress/' + taskId);
+                const data = await resp.json();
+                setProgressItem(item, data);
+                if (data.status === 'done' || data.status === 'error') {
+                    clearInterval(interval);
+                    resolve(data);
+                }
+            } catch (err) {}
+        }, 400);
+    });
+}
+
+async function uploadSingle(file) {
+    const fd = new FormData();
+    fd.append('csv_file', file, file.name);
+    fd.append('analysis_type', 'auto');
+    if (skipAI.checked) fd.append('skip_ai', '1');
+    if (!skipAI.checked) {
+        fd.append('provider', providerSelect.value);
+        fd.append('model', modelSelect.value);
+    }
+    const resp = await fetch('/run', { method: 'POST', body: fd });
+    return await resp.json();
+}
+
+async function uploadMulti(files) {
+    const fd = new FormData();
+    files.forEach(f => fd.append('csv_files', f, f.name));
+    fd.append('analysis_type', 'auto');
+    if (skipAI.checked) fd.append('skip_ai', '1');
+    if (!skipAI.checked) {
+        fd.append('provider', providerSelect.value);
+        fd.append('model', modelSelect.value);
+    }
+    const resp = await fetch('/run_multi', { method: 'POST', body: fd });
+    return await resp.json();
+}
+
+form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const files = Array.from(fileInput.files);
+    if (files.length === 0) {
+        alert('Выберите хотя бы один файл');
+        return;
+    }
+
+    btn.disabled = true;
+    btn.parentElement.classList.add('loading');
+    progressList.innerHTML = '';
+    progressContainer.style.display = 'block';
+
+    try {
+        if (files.length === 1) {
+            // Одиночный режим
+            const item = createProgressItem(files[0].name);
+            const data = await uploadSingle(files[0]);
+            if (data.task_id) {
+                await pollProgress(data.task_id, item);
+            } else {
+                setProgressItem(item, { status: 'error', step: 0, total: 1, error: data.error || 'Не удалось запустить' });
+            }
+        } else {
+            // Мульти-ТФ режим: один общий прогресс-блок для всех файлов
+            const title = `🎯 Сводный Элдер-анализ: ${files.map(f => f.name).join(' + ')}`;
+            const item = createProgressItem(title);
+            const data = await uploadMulti(files);
+            if (data.task_id) {
+                await pollProgress(data.task_id, item);
+            } else {
+                setProgressItem(item, { status: 'error', step: 0, total: 1, error: data.error || 'Не удалось запустить' });
+            }
+        }
+    } finally {
+        btn.disabled = false;
+        btn.parentElement.classList.remove('loading');
+    }
+});
+</script>
+{% endblock %}
