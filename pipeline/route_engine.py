@@ -1543,35 +1543,62 @@ def _build_chain(classified, price, first_step, direction, depth, is_manip,
                     break
 
         if manip_target:
-            # Шаг 1 манипуляции: задёрг к ликвидности
-            route.append({
-                "price": manip_target["price"],
-                "label": "⚡вынос",
-                "status": "manip",
-                "sources": manip_target.get("sources", []),
-            })
-            # Шаг 2: разворот в ИНСТИТУЦИОНАЛЬНОЙ зоне — ближайший POC /
-            # аномальный объём на стороне импульса от точки задёрга
             mt_price = manip_target["price"]
-            inst_point = None
-            inst_cands = []
+            # Разворотная точка = ИНСТИТУЦИОНАЛЬНАЯ зона (Регламент v4):
+            # «разворот → набор позиции в институциональной зоне → импульс».
+            # Зона может лежать ЗА задёргом (цена тянется к POC и разворачивается
+            # там) либо между задёргом и текущей ценой.
+            MAX_INST_DIST_PCT = 0.035
+            beyond_jerk = []   # POC за выносом (продолжение задёрга до зоны)
+            between = []       # POC между выносом и ценой
             for iz in (institutional or []):
                 izp = iz.get("price", 0)
-                if izp <= 0:
+                if izp <= 0 or abs(izp - price) / price > MAX_INST_DIST_PCT:
                     continue
-                # Зона должна лежать со стороны импульса относительно задёрга
-                # и в разумной близости от текущей цены (≤2%)
+                on_jerk_side_beyond = (izp < mt_price) if go_up else (izp > mt_price)
                 on_impulse_side = (izp > mt_price) if go_up else (izp < mt_price)
-                if on_impulse_side and abs(izp - price) / price <= 0.02:
-                    inst_cands.append(izp)
-            if inst_cands:
-                inst_point = min(inst_cands, key=lambda p: abs(p - price))
-            route.append({
-                "price": inst_point if inst_point else price,
-                "label": "↩возврат POC" if inst_point else "↩возврат",
-                "status": "manip_return",
-                "sources": ["POC"] if inst_point else [],
-            })
+                if on_jerk_side_beyond:
+                    beyond_jerk.append(izp)
+                elif on_impulse_side:
+                    between.append(izp)
+
+            manip_poc_used = False
+            if beyond_jerk:
+                # Зона за выносом: задёрг продолжается ДО институциональной зоны,
+                # разворот происходит в ней — вынос и зона сливаются в одну ногу.
+                inst_point = min(beyond_jerk, key=lambda p: abs(p - mt_price))
+                route.append({
+                    "price": mt_price,
+                    "label": "⚡вынос",
+                    "status": "manip",
+                    "sources": manip_target.get("sources", []),
+                })
+                route.append({
+                    "price": inst_point,
+                    "label": "↩разворот POC",
+                    "status": "manip_return",
+                    "sources": ["POC"],
+                })
+                manip_poc_used = True
+            else:
+                route.append({
+                    "price": mt_price,
+                    "label": "⚡вынос",
+                    "status": "manip",
+                    "sources": manip_target.get("sources", []),
+                })
+                inst_point = min(between, key=lambda p: abs(p - price)) if between else None
+                route.append({
+                    "price": inst_point if inst_point else price,
+                    "label": "↩возврат POC" if inst_point else "↩возврат",
+                    "status": "manip_return",
+                    "sources": ["POC"] if inst_point else [],
+                })
+                manip_poc_used = inst_point is not None
+        else:
+            manip_poc_used = False
+    else:
+        manip_poc_used = False
 
     # ── Вспомогательная функция: найти точку отката ──
     def _find_pullback(current_target_price, next_target_price):
@@ -1640,6 +1667,10 @@ def _build_chain(classified, price, first_step, direction, depth, is_manip,
     # Также триггер, если текущий узел явно LPSY или SOW
     if "LPSY" in wyckoff_node or "SOW" in wyckoff_node:
         has_lpsy = True
+    # Если манипуляционный паттерн уже включил разворот в POC —
+    # LPSY-ретест к той же зоне не дублируем
+    if manip_poc_used:
+        has_lpsy = False
 
     # Определяем цену LPSY-коррекции: ближайший POC или D.P (из institutional/counter)
     lpsy_target_price = None
