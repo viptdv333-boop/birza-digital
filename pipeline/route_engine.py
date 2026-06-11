@@ -584,6 +584,7 @@ def build_route(sections_map: dict, price: float, direction: str, tf_hours: floa
         s8, s11, s13, s17, has_divergence, direction,
         s4=s4, s5=s5, s10=s10, s16=s16, s9=s9,
         price=price, atr_daily=atr_daily, move_dir=_local_dir,
+        fs_dir=first_step_dir.get("direction"),
     )
 
     # 6d. Глубина маршрута по k_темпа
@@ -1218,7 +1219,7 @@ def _determine_first_step(s1, s2, s5, s10, s13, magnets, price, direction):
 
 def _check_manipulation(s8, s11, s13, s17, has_divergence, direction,
                         s4=None, s5=None, s10=None, s16=None, s9=None,
-                        price=None, atr_daily=None, move_dir=None):
+                        price=None, atr_daily=None, move_dir=None, fs_dir=None):
     """Чек-лист манипуляции — Правило 2 Регламента v4 (Дополнение).
 
     Ровно 4 критерия, порог 3 из 4:
@@ -1282,7 +1283,9 @@ def _check_manipulation(s8, s11, s13, s17, has_divergence, direction,
             f"Stoch={stoch_k if stoch_k is not None else '—'}, MFI={mfi_val if mfi_val is not None else '—'})"
         )
 
-    # ── 3. Ликвидность по ходу движения (≤1.5% в направлении move) ──
+    # ── 3. Ликвидность-приманка (≤1.5%): по ходу движения ИЛИ на стороне
+    # первого шага. Задёрг идёт к БЛИЖАЙШЕЙ ликвидности — она может лежать
+    # и против локального тренда (стопы за swing_high при сползании вниз).
     LIQ_MAX_PCT = 0.015
     liq_ahead = []
     if price:
@@ -1292,7 +1295,7 @@ def _check_manipulation(s8, s11, s13, s17, has_divergence, direction,
                 p = st.get("stop_zone") or st.get("level")
                 if p:
                     liq_ahead.append(("стопы", p))
-        # FVG / гэпы (S13)
+        # FVG / гэпы / магниты (S13)
         for f in s13.get("open_fvgs", []):
             mid = (f.get("top", 0) + f.get("bottom", 0)) / 2
             if mid > 0:
@@ -1301,17 +1304,28 @@ def _check_manipulation(s8, s11, s13, s17, has_divergence, direction,
             mid = (g.get("gap_top", 0) + g.get("gap_bottom", 0)) / 2
             if mid > 0:
                 liq_ahead.append(("гэп", mid))
+        for mg in s13.get("magnets", []):
+            if mg.get("price"):
+                liq_ahead.append((str(mg.get("type", "магнит")), mg["price"]))
         # Тонкие зоны VP (S09)
         for pkey in ("profile_a", "profile_b"):
             for ta in s9.get(pkey, {}).get("thin_areas", []):
                 if ta.get("price"):
                     liq_ahead.append(("тонкая зона", ta["price"]))
 
-        # Фильтр: по ходу движения и в пределах 1.5%
+        # Сторона приманки: по ходу движения или куда смотрит первый шаг
+        fs_up = (fs_dir == "вверх") if fs_dir in ("вверх", "вниз") else None
+
+        def _is_lure_side(p):
+            on_move = (p > price) if move_up else (p < price)
+            if fs_up is None:
+                return on_move
+            on_fs = (p > price) if fs_up else (p < price)
+            return on_move or on_fs
+
         liq_ahead = [
             (t, p) for t, p in liq_ahead
-            if (p > price if move_up else p < price)
-            and abs(p - price) / price <= LIQ_MAX_PCT
+            if _is_lure_side(p) and abs(p - price) / price <= LIQ_MAX_PCT
         ]
     sign3 = bool(liq_ahead)
     signs_map["liquidity_ahead"] = sign3
@@ -1319,11 +1333,11 @@ def _check_manipulation(s8, s11, s13, s17, has_divergence, direction,
         signs += 1
         nearest = min(liq_ahead, key=lambda x: abs(x[1] - price))
         details.append(
-            f"✅ 3/4 Ликвидность по ходу движения: {nearest[0]} {nearest[1]:.4g} "
+            f"✅ 3/4 Ликвидность-приманка: {nearest[0]} {nearest[1]:.4g} "
             f"({len(liq_ahead)} зон ≤1.5%)"
         )
     else:
-        details.append("❌ 3/4 Ликвидности по ходу движения (≤1.5%) нет")
+        details.append("❌ 3/4 Ликвидности-приманки (≤1.5%) нет")
 
     # ── 4. Институциональный интерес за спиной ──
     inst_behind = []
