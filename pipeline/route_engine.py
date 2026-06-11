@@ -108,13 +108,34 @@ def collect_all_targets(sections_map: dict, price: float) -> list[dict]:
     # Отсечь мусор > 50% от цены
     raw = [t for t in raw if abs(t["price"] - price) / price < 0.50]
 
-    # Отсечь цели слишком близкие к текущей цене (<0.5%)
-    raw = [t for t in raw if abs(t["price"] - price) / price > 0.002]
+    # Отсечь цели слишком близкие к текущей цене (<0.3% — Регламент v4, шаг 7)
+    raw = [t for t in raw if abs(t["price"] - price) / price > 0.003]
 
     # Группировка: цели в пределах 0.3% → оставляем одну с наивысшим приоритетом
     raw = _group_close_targets(raw)
 
     return raw
+
+
+# Семейства индикаторов (Регламент v4, Правило 1 шаг 2):
+# ключевая цель = 2+ подтверждения из РАЗНЫХ семейств
+_SOURCE_FAMILY = {
+    "Pivot": "structure", "Swing": "structure",
+    "Fibo": "fibo",
+    "POC": "volume", "VAH": "volume", "VAL": "volume",
+    "W.POC": "volume", "W.VAH": "volume", "W.VAL": "volume",
+    "Wyckoff_POC": "volume", "Wyckoff_VAH": "volume", "Wyckoff_VAL": "volume",
+    "ThinVP": "volume",
+    "Stop": "liquidity", "Liquidity": "liquidity",
+    "FVG": "imbalance", "Gap": "imbalance",
+    "Wave": "waves",
+    "Pattern": "patterns",
+}
+
+
+def _count_families(sources: list) -> int:
+    """Сколько РАЗНЫХ семейств индикаторов подтверждают цель."""
+    return len({_SOURCE_FAMILY.get(s, s) for s in sources if s})
 
 
 # Приоритет источников для группировки (меньше = выше приоритет)
@@ -131,7 +152,7 @@ _SOURCE_PRIORITY = {
 }
 
 
-def _group_close_targets(targets: list[dict], threshold_pct: float = 0.5) -> list[dict]:
+def _group_close_targets(targets: list[dict], threshold_pct: float = 0.3) -> list[dict]:
     """Группировать цели в пределах threshold_pct% друг от друга.
 
     Из каждой группы оставляем цель с наивысшим приоритетом источника.
@@ -183,13 +204,19 @@ def _group_close_targets(targets: list[dict], threshold_pct: float = 0.5) -> lis
     return result
 
 
-def build_route(sections_map: dict, price: float, direction: str, tf_hours: float = 4.0) -> dict:
+def build_route(sections_map: dict, price: float, direction: str, tf_hours: float = 4.0,
+                k_effect: float | None = None,
+                extra_sections_maps: list | None = None) -> dict:
     """Построить маршрут по 9-шаговому алгоритму v6.
 
     Args:
-        sections_map: {section_id: {"data": {...}}, ...}
+        sections_map: {section_id: {"data": {...}}, ...} — старший ТФ
         price: текущая цена
         direction: "восходящий" / "нисходящий" / "боковик"
+        k_effect: взвешенное k по ТФ (старший 0.5, рабочий 0.3, младший 0.2);
+            если None — используется k_tempo старшего ТФ
+        extra_sections_maps: секции младших/средних ТФ — их цели УТОЧНЯЮТ
+            структуру маршрута (Регламент v4: младший ТФ детализирует)
 
     Returns:
         {
@@ -232,78 +259,90 @@ def build_route(sections_map: dict, price: float, direction: str, tf_hours: floa
     # ═══════════════════════════════════════════
     raw_targets = []  # (price, source_name, section_id)
 
-    # S06 — уровни S/R (Pivot для пивот-уровней D./W./M., Swing для свингов)
-    for r in s6.get("resistances", s6.get("resistances_5", [])):
-        lbl = r.get("label", "")
-        src = "Pivot" if any(lbl.startswith(p) for p in ("D.", "W.", "M.")) else "Swing"
-        raw_targets.append((r["price"], src, 6))
-    for sup in s6.get("supports", s6.get("supports_5", [])):
-        lbl = sup.get("label", "")
-        src = "Pivot" if any(lbl.startswith(p) for p in ("D.", "W.", "M.")) else "Swing"
-        raw_targets.append((sup["price"], src, 6))
+    def _collect_targets_from(smap: dict) -> None:
+        """Собрать цели из одной карты секций (одного ТФ) в raw_targets."""
+        sx = lambda sid: smap.get(sid, {}).get("data", {})
+        x2, x3, x6, x7, x9, x10, x11, x13 = (
+            sx(2), sx(3), sx(6), sx(7), sx(9), sx(10), sx(11), sx(13))
 
-    # S07 — Фибо (senior_trend + local_trend: retracements и extensions)
-    for trend_key in ("senior_trend", "local_trend"):
-        block = s7.get(trend_key, {})
-        for r in block.get("retracements", []):
-            raw_targets.append((r["price"], "Fibo", 7))
-        for e in block.get("extensions", []):
-            raw_targets.append((e["price"], "Fibo", 7))
+        # S06 — уровни S/R (Pivot для пивот-уровней D./W./M., Swing для свингов)
+        for r in x6.get("resistances", x6.get("resistances_5", [])):
+            lbl = r.get("label", "")
+            src = "Pivot" if any(lbl.startswith(p) for p in ("D.", "W.", "M.")) else "Swing"
+            raw_targets.append((r["price"], src, 6))
+        for sup in x6.get("supports", x6.get("supports_5", [])):
+            lbl = sup.get("label", "")
+            src = "Pivot" if any(lbl.startswith(p) for p in ("D.", "W.", "M.")) else "Swing"
+            raw_targets.append((sup["price"], src, 6))
 
-    # S09 — VP (два профиля)
-    for pkey in ("profile_a", "profile_b"):
-        prof = s9.get(pkey, {})
+        # S07 — Фибо (senior_trend + local_trend: retracements и extensions)
+        for trend_key in ("senior_trend", "local_trend"):
+            block = x7.get(trend_key, {})
+            for r in block.get("retracements", []):
+                raw_targets.append((r["price"], "Fibo", 7))
+            for e in block.get("extensions", []):
+                raw_targets.append((e["price"], "Fibo", 7))
+
+        # S09 — VP (два профиля)
+        for pkey in ("profile_a", "profile_b"):
+            prof = x9.get(pkey, {})
+            for vk in ("POC", "VAH", "VAL"):
+                item = prof.get(vk, {})
+                if isinstance(item, dict) and "price" in item:
+                    raw_targets.append((item["price"], vk, 9))
+
+        # S11 — стопы
+        for st in x11.get("stops_below", x11.get("stops_below_supports", [])):
+            p = st.get("stop_zone") or st.get("level")
+            if p:
+                raw_targets.append((p, "Stop", 11))
+        for st in x11.get("stops_above", x11.get("stops_above_resistances", [])):
+            p = st.get("stop_zone") or st.get("level")
+            if p:
+                raw_targets.append((p, "Stop", 11))
+
+        # S02 — волновые цели
+        for wt in x2.get("wave_targets", []):
+            raw_targets.append((wt["price"], "Wave", 2))
+
+        # S03 — паттерны
+        for pat in x3.get("patterns", []):
+            if pat.get("target"):
+                raw_targets.append((pat["target"], "Pattern", 3))
+
+        # S13 — FVG/гэпы
+        for fvg in x13.get("open_fvgs", []):
+            mid = (fvg.get("top", 0) + fvg.get("bottom", 0)) / 2
+            if mid > 0:
+                raw_targets.append((mid, "FVG", 13))
+        for gap in x13.get("open_gaps", []):
+            mid = (gap.get("gap_top", 0) + gap.get("gap_bottom", 0)) / 2
+            if mid > 0:
+                raw_targets.append((mid, "Gap", 13))
+
+        # Тонкие зоны VP
+        for pkey in ("profile_a", "profile_b"):
+            for ta in x9.get(pkey, {}).get("thin_areas", []):
+                if ta.get("price"):
+                    raw_targets.append((ta["price"], "ThinVP", 9))
+
+        # Пулы ликвидности из S13
+        for lp in x13.get("liquidity_pools", []):
+            if lp.get("price"):
+                raw_targets.append((lp["price"], "Liquidity", 13))
+
+        # S10 — Вайкофф (POC/VAH/VAL как цели)
+        vp_wyckoff = x10.get("volume_profile", {})
         for vk in ("POC", "VAH", "VAL"):
-            item = prof.get(vk, {})
-            if isinstance(item, dict) and "price" in item:
-                raw_targets.append((item["price"], vk, 9))
+            val = vp_wyckoff.get(vk)
+            if val and val > 0:
+                raw_targets.append((val, f"Wyckoff_{vk}", 10))
 
-    # S11 — стопы
-    for st in s11.get("stops_below", s11.get("stops_below_supports", [])):
-        p = st.get("stop_zone") or st.get("level")
-        if p:
-            raw_targets.append((p, "Stop", 11))
-    for st in s11.get("stops_above", s11.get("stops_above_resistances", [])):
-        p = st.get("stop_zone") or st.get("level")
-        if p:
-            raw_targets.append((p, "Stop", 11))
-
-    # S02 — волновые цели
-    for wt in s2.get("wave_targets", []):
-        raw_targets.append((wt["price"], "Wave", 2))
-
-    # S03 — паттерны
-    for pat in s3.get("patterns", []):
-        if pat.get("target"):
-            raw_targets.append((pat["target"], "Pattern", 3))
-
-    # S13 — FVG/гэпы
-    for fvg in s13.get("open_fvgs", []):
-        mid = (fvg.get("top", 0) + fvg.get("bottom", 0)) / 2
-        if mid > 0:
-            raw_targets.append((mid, "FVG", 13))
-    for gap in s13.get("open_gaps", []):
-        mid = (gap.get("gap_top", 0) + gap.get("gap_bottom", 0)) / 2
-        if mid > 0:
-            raw_targets.append((mid, "Gap", 13))
-
-    # Тонкие зоны VP
-    for pkey in ("profile_a", "profile_b"):
-        for ta in s9.get(pkey, {}).get("thin_areas", []):
-            if ta.get("price"):
-                raw_targets.append((ta["price"], "ThinVP", 9))
-
-    # Пулы ликвидности из S13
-    for lp in s13.get("liquidity_pools", []):
-        if lp.get("price"):
-            raw_targets.append((lp["price"], "Liquidity", 13))
-
-    # S10 — Вайкофф (POC/VAH/VAL как цели)
-    vp_wyckoff = s10.get("volume_profile", {})
-    for vk in ("POC", "VAH", "VAL"):
-        val = vp_wyckoff.get(vk)
-        if val and val > 0:
-            raw_targets.append((val, f"Wyckoff_{vk}", 10))
+    # Старший ТФ задаёт цели; младшие/средние ТФ УТОЧНЯЮТ структуру
+    # (Регламент v4: «каждый младший ТФ уточняет структуру маршрута»)
+    _collect_targets_from(sections_map)
+    for extra_map in (extra_sections_maps or []):
+        _collect_targets_from(extra_map)
 
     # ═══════════════════════════════════════════
     # ШАГ 2: Классифицировать (детерминированно)
@@ -313,10 +352,9 @@ def build_route(sections_map: dict, price: float, direction: str, tf_hours: floa
     # Сортировка стабильная: по цене, затем по имени источника
     sorted_raw = sorted(raw_targets, key=lambda t: (t[0], t[1], t[2]))
 
-    # ATR-адаптивный порог группировки: 0.5 * ATR текущего ТФ
-    # Для 15m ATR≈0.015 → 0.3%, для 4H ATR≈0.04 → 0.8%
+    # Порог группировки — Регламент v4 (шаг 7): цели ближе 0.3% = одна зона
     atr_tf = s12.get("atr_tf", price * 0.01)
-    group_threshold = 0.5 * atr_tf / price if price > 0 else 0.005
+    group_threshold = 0.003
 
     groups = []  # [sum_price, count, sources_list, section_ids_list]
     for tp, src, sid in sorted_raw:
@@ -354,7 +392,7 @@ def build_route(sections_map: dict, price: float, direction: str, tf_hours: floa
     for g in groups:
         avg_p = g[0] / g[1]
         dist = abs(avg_p - price) / price
-        if dist < max_dist_pct and dist > 0.002:
+        if dist < max_dist_pct and dist > 0.003:
             valid_groups.append((avg_p, g[1], sorted(g[2]), sorted(g[3])))
 
     # Сортировка по расстоянию от цены (детерминированно)
@@ -364,14 +402,15 @@ def build_route(sections_map: dict, price: float, direction: str, tf_hours: floa
     other_targets = []
     sec_targets = []  # устарело, оставлено пустым для обратной совместимости сигнатур
 
-    # v8: 2 уровня — Ключевые и Остальные
-    #   Ключевые = 3+ подтверждений из разных разделов ИЛИ пивот-комбо (пивот + ≥1 другой источник)
-    #   Остальные = все прочие
+    # Регламент v4 (Правило 1, шаг 2):
+    #   Ключевые = конфлюэнс 2+ подтверждения из РАЗНЫХ СЕМЕЙСТВ индикаторов
+    #   Второстепенные = 1 подтверждение или кластер близких уровней
     # k-темпа: k>1.2 → other→key (кап 8 промоушенов); k<0.8 → key→other
     # ВСЕ цели остаются в маршруте.
     for avg_p, cnt, srcs, sids in valid_groups:
         n_src = len(srcs)
         n_sections = len(sids)
+        n_families = _count_families(srcs)
         entry = _fmt(avg_p, price)
         entry_src = _fmt_with_sources(avg_p, price, srcs)
         item = {
@@ -381,14 +420,15 @@ def build_route(sections_map: dict, price: float, direction: str, tf_hours: floa
             "sources": srcs,
             "sections": sids,
             "n_sections": n_sections,
+            "n_families": n_families,
         }
 
         # Пивоты (D.P, D.R1, D.S1, W.P) — структурно важны
         has_pivot = "Pivot" in srcs
         pivot_combo = has_pivot and n_src >= 2
 
-        # v8: ключевая = 3+ разделов или пивот-комбо
-        if n_sections >= 3 or pivot_combo:
+        # Регламент: ключевая = 2+ семейства индикаторов (или пивот-комбо)
+        if n_families >= 2 or pivot_combo:
             tier = "key"
         else:
             tier = "other"
@@ -409,8 +449,9 @@ def build_route(sections_map: dict, price: float, direction: str, tf_hours: floa
         else:
             other_targets.append(item)
 
-    # v8: бюджет для маршрута 8–15 узлов, итого целей ≤24 (ключевые+остальные)
-    max_key, max_other = 10, 14
+    # Регламент: «ни одна цель не игнорируется»; маршрут = зигзаг через 20–30 целей.
+    # Мягкий потолок 30 (12+18) — защита от вырожденных данных, не рабочий лимит.
+    max_key, max_other = 12, 18
     key_targets = key_targets[:max_key]
     other_targets = other_targets[:max_other]
 
@@ -491,45 +532,58 @@ def build_route(sections_map: dict, price: float, direction: str, tf_hours: floa
     # 6b. Первый шаг — по структуре (волны, Вайкофф, ближайший магнит)
     first_step_dir = _determine_first_step(s1, s2, s5, s10, s13, magnets, price, direction)
 
-    # v8 first_step_rule: "Первый шаг — реальный ближайший шаг по графику,
-    # а не желаемое направление. Маршрут не может начинаться с пробоя уровня,
-    # до которого ещё надо дойти."
-    # Проверка: ближайший уровень S/R (magnet/stop/FVG) определяет реальный первый шаг.
-    _nearest_above = None
-    _nearest_below = None
-    for m in magnets:
-        mp = m.get("price", 0)
-        if mp <= 0:
-            continue
-        if mp > price and (_nearest_above is None or mp < _nearest_above):
-            _nearest_above = mp
-        elif mp < price and (_nearest_below is None or mp > _nearest_below):
-            _nearest_below = mp
-    # если явно виден один из магнитов ближе другого в 2× — он доминирует
-    if _nearest_above and _nearest_below:
-        d_up = _nearest_above - price
-        d_dn = price - _nearest_below
-        if d_up > 0 and d_dn > 0:
-            if d_up * 2 < d_dn:
-                # ближайший магнит сверху → реальный первый шаг вверх
-                first_step_dir["direction"] = "вверх"
-                first_step_dir.setdefault("reasons_v8", []).append(
-                    f"v8: ближайший магнит сверху {_nearest_above:.4g} (d={d_up:.4g}) "
-                    f"vs снизу {_nearest_below:.4g} (d={d_dn:.4g})"
-                )
-            elif d_dn * 2 < d_up:
-                first_step_dir["direction"] = "вниз"
-                first_step_dir.setdefault("reasons_v8", []).append(
-                    f"v8: ближайший магнит снизу {_nearest_below:.4g} (d={d_dn:.4g}) "
-                    f"vs сверху {_nearest_above:.4g} (d={d_up:.4g})"
-                )
+    # Правило близости (Регламент v4, раздел 13): ближайший магнит ≤0.6×ATR
+    # учитывается ПЕРВЫМ. S13 уже применил фильтр 0.6×ATR — его first_step
+    # имеет приоритет над любыми эвристиками.
+    _s13_fs = s13.get("first_step")
+    if _s13_fs and _s13_fs.get("direction") in ("вверх", "вниз"):
+        first_step_dir["direction"] = _s13_fs["direction"]
+        first_step_dir.setdefault("reasons_v8", []).append(
+            f"правило близости ≤0.6×ATR: {_s13_fs.get('reason', _s13_fs.get('target'))}"
+        )
+    else:
+        # Магнита в радиусе 0.6×ATR нет — fallback: если один из ближайших
+        # магнитов в 2× ближе другого, он определяет реальный первый шаг.
+        _nearest_above = None
+        _nearest_below = None
+        for m in magnets:
+            mp = m.get("price", 0)
+            if mp <= 0:
+                continue
+            if mp > price and (_nearest_above is None or mp < _nearest_above):
+                _nearest_above = mp
+            elif mp < price and (_nearest_below is None or mp > _nearest_below):
+                _nearest_below = mp
+        if _nearest_above and _nearest_below:
+            d_up = _nearest_above - price
+            d_dn = price - _nearest_below
+            if d_up > 0 and d_dn > 0:
+                if d_up * 2 < d_dn:
+                    # ближайший магнит сверху → реальный первый шаг вверх
+                    first_step_dir["direction"] = "вверх"
+                    first_step_dir.setdefault("reasons_v8", []).append(
+                        f"v8: ближайший магнит сверху {_nearest_above:.4g} (d={d_up:.4g}) "
+                        f"vs снизу {_nearest_below:.4g} (d={d_dn:.4g})"
+                    )
+                elif d_dn * 2 < d_up:
+                    first_step_dir["direction"] = "вниз"
+                    first_step_dir.setdefault("reasons_v8", []).append(
+                        f"v8: ближайший магнит снизу {_nearest_below:.4g} (d={d_dn:.4g}) "
+                        f"vs сверху {_nearest_above:.4g} (d={d_up:.4g})"
+                    )
 
-    # 6c. Чек-лист манипуляции по ЯДРУ v8 (3 из 6 признаков)
+    # 6c. Чек-лист манипуляции — Правило 2 Регламента v4 (4 критерия, 3 из 4)
     s4 = s(4)
+    # Текущее движение = локальный тренд (S01), если есть; иначе первый шаг; иначе старший тренд
+    _local_dir = (s1.get("local_trend") or {}).get("direction")
+    if _local_dir not in ("восходящий", "нисходящий"):
+        _fs = first_step_dir.get("direction")
+        _local_dir = ("восходящий" if _fs == "вверх" else
+                      "нисходящий" if _fs == "вниз" else direction)
     manip = _check_manipulation(
         s8, s11, s13, s17, has_divergence, direction,
-        s4=s4, s5=s5, s10=s10,
-        price=price, atr_daily=atr_daily,
+        s4=s4, s5=s5, s10=s10, s16=s16, s9=s9,
+        price=price, atr_daily=atr_daily, move_dir=_local_dir,
     )
 
     # 6d. Глубина маршрута по k_темпа
@@ -763,9 +817,9 @@ def build_route(sections_map: dict, price: float, direction: str, tf_hours: floa
     _scenario_up = _max_up_pct >= _max_dn_pct
     extreme_pct = _max_up_pct if _scenario_up else _max_dn_pct
 
-    # Pullback-надбавка 20% по v8 (откат в направлении тренда считается пройденным путём)
-    PULLBACK_FACTOR = 1.2
-    total_dist_pct = extreme_pct * PULLBACK_FACTOR
+    # Регламент v4 (раздел IV): Dist% = расстояние крайних целей,
+    # без надбавок (пример регламента: 100→106 → Dist=6%)
+    total_dist_pct = extreme_pct
 
     # резервный путь: максимальное отклонение, если extreme не найден
     if total_dist_pct <= 0:
@@ -795,14 +849,18 @@ def build_route(sections_map: dict, price: float, direction: str, tf_hours: floa
         elif k_tempo >= 1.2 and _trend_aligns:
             F = 1.0
 
-    denom = k_tempo * atr_daily_pct * F
-    days = math.ceil(total_dist_pct / denom) if denom > 0 and total_dist_pct > 0 else 1
-    days = max(days, 1)
+    # Регламент v4: k_эффект = взвешенное k по ТФ (старший 0.5, рабочий 0.3,
+    # младший 0.2). В мульти-ТФ передаётся снаружи; одиночный ТФ — k_tempo.
+    k_used = k_effect if (k_effect is not None and k_effect > 0) else k_tempo
+    denom = k_used * atr_daily_pct * F
+    days_float = (total_dist_pct / denom) if denom > 0 and total_dist_pct > 0 else 1.0
+    days = max(math.ceil(days_float), 1)
+    hours = max(math.ceil(days_float * 24), 1)  # для интрадей-горизонтов
     farthest_pct = total_dist_pct  # для совместимости ниже
 
     # ── v8: диапазон сроков (fast F=1.0 / slow F=0.7) для читаемого «min–max дней» ──
     def _days_for(F_val):
-        d = k_tempo * atr_daily_pct * F_val
+        d = k_used * atr_daily_pct * F_val
         if d <= 0 or total_dist_pct <= 0:
             return 1
         return max(math.ceil(total_dist_pct / d), 1)
@@ -934,9 +992,10 @@ def build_route(sections_map: dict, price: float, direction: str, tf_hours: floa
         "slam_str": slam_str,
         "slam_reason": slam_reason,
         "days": days,
+        "hours": hours,
         "days_min": days_min,
         "days_max": days_max,
-        "days_detail": f"Total_dist={total_dist_pct:.1f}%, K={k_tempo}, ATR_дн={atr_daily_pct:.2f}%, F={F}",
+        "days_detail": f"Total_dist={total_dist_pct:.1f}%, K={k_used:.2f}, ATR_дн={atr_daily_pct:.2f}%, F={F}",
         "total_dist_pct": round(total_dist_pct, 2),
         "F_factor": F,
         "horizon_label": horizon_label,
@@ -1039,11 +1098,35 @@ def _determine_first_step(s1, s2, s5, s10, s13, magnets, price, direction):
 
     node = s10.get("current_node", "")
     if "SOS" in node or "LPS" in node or "SPRING" in node or "BU" in node:
-        check2_reason.append(f"Вайкофф: {node} → вверх")
+        check2_reason.append(f"Вайкофф: {node} -> вверх")
         check2_dir = "вверх"
     elif "SOW" in node or "LPSY" in node or "UT" in node or "UTAD" in node:
-        check2_reason.append(f"Вайкофф: {node} → вниз")
+        check2_reason.append(f"Вайкофф: {node} -> вниз")
         check2_dir = "вниз"
+
+    # Бэктест: structure_type (Накопление/Распределение) — сильный предиктор (+4.1% WR)
+    structure_type = (s10.get("structure_type") or "").lower()
+    if "накопление" in structure_type or "accumulation" in structure_type:
+        if check2_dir is None:
+            check2_dir = "вверх"
+        check2_reason.append("структура: Накопление")
+    elif "распределение" in structure_type or "distribution" in structure_type:
+        if check2_dir is None:
+            check2_dir = "вниз"
+        check2_reason.append("структура: Распределение")
+
+    # CMF — бэктест: CMF sellers на bull = 69.4% WR (слабый), CMF buyers на bear = 92.3% (сильный)
+    cmf_data = s10.get("evidence", {})
+    cmf_val = cmf_data.get("cmf", 0)
+    if isinstance(cmf_val, (int, float)) and cmf_val != 0:
+        if cmf_val < -0.1:
+            check2_reason.append(f"CMF {cmf_val:.3f} (отток)")
+            if check2_dir is None:
+                check2_dir = "вниз"
+        elif cmf_val > 0.1:
+            check2_reason.append(f"CMF {cmf_val:.3f} (приток)")
+            if check2_dir is None:
+                check2_dir = "вверх"
 
     phase = s10.get("phase", "")
     if phase:
@@ -1133,158 +1216,146 @@ def _determine_first_step(s1, s2, s5, s10, s13, magnets, price, direction):
 
 
 def _check_manipulation(s8, s11, s13, s17, has_divergence, direction,
-                        s4=None, s5=None, s10=None,
-                        price=None, atr_daily=None):
-    """6-признаковый чек-лист манипуляции по ЯДРУ v8.
+                        s4=None, s5=None, s10=None, s16=None, s9=None,
+                        price=None, atr_daily=None, move_dir=None):
+    """Чек-лист манипуляции — Правило 2 Регламента v4 (Дополнение).
 
-    Признаки (route.manipulation_checklist):
-      1. S11: скопление стопов ≤ 1×ATR(дн) от текущей цены
-      2. S13: незаполненный FVG/гэп в противоположном направлении от основной цели
-      3. S10: фаза SPRING (ложный пробой вниз) или UTAD (ложный пробой вверх) по Вайкоффу
-      4. S08: аномальный объём без движения цены (Climax) — крупный игрок набирает позицию
-      5. S04: длинные тени, ложные пробои уровней, выносы за хай/лой и возврат
-      6. S05: дивергенция RSI или CVD с ценой
+    Ровно 4 критерия, порог 3 из 4:
+      1. Дивергенция CVD vs цена (движение обеспечено лимитными, не рыночными)
+      2. Перегрев осцилляторов БЕЗ экстремума: Stochastic >80/<20 или
+         MFI >75/<25, но RSI в нейтральной зоне 30–70
+      3. Ликвидность ПО ХОДУ движения: стопы/FVG/тонкие зоны
+         в пределах 1.5% от цены в направлении текущего движения
+      4. Институциональный интерес ЗА СПИНОЙ: POC / аномальный объём /
+         вход крупняка на противоположной стороне от движения
 
-    Порог: 3 из 6 признаков → манипуляция вероятна (включить в маршрут).
+    move_dir — направление ТЕКУЩЕГО движения ("восходящий"/"нисходящий"),
+    по умолчанию = direction (старший тренд).
     """
     s4 = s4 or {}
     s5 = s5 or {}
     s10 = s10 or {}
+    s16 = s16 or {}
+    s9 = s9 or {}
+    move = move_dir or direction
+    move_up = (move == "восходящий")
+
     signs = 0
     details = []
     signs_map = {}
 
-    # ── 1. S11: стопы ≤ 1×ATR(дн) от текущей цены ──
-    stops_all = []
-    for st in s11.get("stops_below", s11.get("stops_below_supports", [])):
-        p = st.get("stop_zone") or st.get("level")
-        if p:
-            stops_all.append(("below", p))
-    for st in s11.get("stops_above", s11.get("stops_above_resistances", [])):
-        p = st.get("stop_zone") or st.get("level")
-        if p:
-            stops_all.append(("above", p))
-
-    sign1 = False
-    if price and atr_daily and atr_daily > 0:
-        near_stops = [s for s in stops_all if abs(s[1] - price) <= atr_daily]
-        if near_stops:
-            sign1 = True
-            nearest = min(near_stops, key=lambda s: abs(s[1] - price))
-            details.append(
-                f"✅ S11: стопы ≤1×ATR(дн) — {nearest[0]} {nearest[1]:.4g} "
-                f"({len(near_stops)} зон)"
-            )
-        else:
-            details.append(f"❌ S11: стопов в радиусе 1×ATR(дн)={atr_daily:.4g} нет")
-    else:
-        details.append("❌ S11: нет данных по ATR для оценки")
-    signs_map["stops_near"] = sign1
+    # ── 1. Дивергенция CVD vs цена ──
+    cvd_div = s5.get("cvd_divergence")
+    sign1 = bool(cvd_div)
+    signs_map["cvd_divergence"] = sign1
     if sign1:
         signs += 1
+        details.append(f"✅ 1/4 Дивергенция CVD vs цена: {cvd_div}")
+    else:
+        details.append("❌ 1/4 Дивергенции CVD vs цена нет")
 
-    # ── 2. S13: незаполненный FVG/гэп в противоположном направлении ──
-    fvgs = s13.get("open_fvgs", [])
-    gaps = s13.get("open_gaps", [])
-    # Основная цель = по тренду. Противоположное направление от неё:
-    # тренд вверх → ищем FVG НИЖЕ цены; тренд вниз → ищем FVG ВЫШЕ.
-    opposite_fvgs = []
-    for f in fvgs:
-        mid = (f.get("top", 0) + f.get("bottom", 0)) / 2
-        if mid <= 0 or price is None:
-            continue
-        if direction == "восходящий" and mid < price:
-            opposite_fvgs.append(f)
-        elif direction == "нисходящий" and mid > price:
-            opposite_fvgs.append(f)
-    for g in gaps:
-        mid = (g.get("gap_top", 0) + g.get("gap_bottom", 0)) / 2
-        if mid <= 0 or price is None:
-            continue
-        if direction == "восходящий" and mid < price:
-            opposite_fvgs.append(g)
-        elif direction == "нисходящий" and mid > price:
-            opposite_fvgs.append(g)
-    sign2 = bool(opposite_fvgs)
-    signs_map["opposite_fvg"] = sign2
+    # ── 2. Перегрев осцилляторов при нейтральном RSI ──
+    rsi_val = s5.get("rsi_current")
+    stoch = s5.get("stochastic") or {}
+    stoch_k = stoch.get("k")
+    mfi_val = (s16.get("mfi") or {}).get("value")
+
+    rsi_neutral = rsi_val is not None and 30 <= rsi_val <= 70
+    stoch_hot = stoch_k is not None and (stoch_k > 80 or stoch_k < 20)
+    mfi_hot = mfi_val is not None and (mfi_val > 75 or mfi_val < 25)
+    sign2 = rsi_neutral and (stoch_hot or mfi_hot)
+    signs_map["oscillator_overheat"] = sign2
     if sign2:
         signs += 1
-        details.append(f"✅ S13: незаполненный FVG/гэп против цели ({len(opposite_fvgs)} шт)")
+        osc = []
+        if stoch_hot:
+            osc.append(f"Stoch %K={stoch_k:.0f}")
+        if mfi_hot:
+            osc.append(f"MFI={mfi_val:.0f}")
+        details.append(
+            f"✅ 2/4 Перегрев без экстремума: {', '.join(osc)} при RSI={rsi_val:.0f} (нейтрален)"
+        )
     else:
-        details.append(f"❌ S13: FVG/гэп против цели не найдены (всего FVG: {len(fvgs)}, гэпов: {len(gaps)})")
+        details.append(
+            f"❌ 2/4 Перегрева без экстремума нет (RSI={rsi_val if rsi_val is not None else '—'}, "
+            f"Stoch={stoch_k if stoch_k is not None else '—'}, MFI={mfi_val if mfi_val is not None else '—'})"
+        )
 
-    # ── 3. S10: SPRING или UTAD ──
-    wyckoff_node = (s10.get("current_node") or "").upper()
-    wyckoff_phase_desc = (s10.get("phase_description") or "").upper()
-    sign3 = any(kw in wyckoff_node or kw in wyckoff_phase_desc
-                for kw in ("SPRING", "UTAD", "UT"))
-    # отдельно UT (upthrust) — ложный пробой вверх
-    signs_map["wyckoff_false_break"] = sign3
+    # ── 3. Ликвидность по ходу движения (≤1.5% в направлении move) ──
+    LIQ_MAX_PCT = 0.015
+    liq_ahead = []
+    if price:
+        # Стопы (S11)
+        for key in ("stops_below", "stops_below_supports", "stops_above", "stops_above_resistances"):
+            for st in s11.get(key, []):
+                p = st.get("stop_zone") or st.get("level")
+                if p:
+                    liq_ahead.append(("стопы", p))
+        # FVG / гэпы (S13)
+        for f in s13.get("open_fvgs", []):
+            mid = (f.get("top", 0) + f.get("bottom", 0)) / 2
+            if mid > 0:
+                liq_ahead.append(("FVG", mid))
+        for g in s13.get("open_gaps", []):
+            mid = (g.get("gap_top", 0) + g.get("gap_bottom", 0)) / 2
+            if mid > 0:
+                liq_ahead.append(("гэп", mid))
+        # Тонкие зоны VP (S09)
+        for pkey in ("profile_a", "profile_b"):
+            for ta in s9.get(pkey, {}).get("thin_areas", []):
+                if ta.get("price"):
+                    liq_ahead.append(("тонкая зона", ta["price"]))
+
+        # Фильтр: по ходу движения и в пределах 1.5%
+        liq_ahead = [
+            (t, p) for t, p in liq_ahead
+            if (p > price if move_up else p < price)
+            and abs(p - price) / price <= LIQ_MAX_PCT
+        ]
+    sign3 = bool(liq_ahead)
+    signs_map["liquidity_ahead"] = sign3
     if sign3:
         signs += 1
-        details.append(f"✅ S10: Вайкофф — {wyckoff_node or wyckoff_phase_desc} (ложный пробой)")
+        nearest = min(liq_ahead, key=lambda x: abs(x[1] - price))
+        details.append(
+            f"✅ 3/4 Ликвидность по ходу движения: {nearest[0]} {nearest[1]:.4g} "
+            f"({len(liq_ahead)} зон ≤1.5%)"
+        )
     else:
-        details.append(f"❌ S10: SPRING/UTAD/UT не зафиксированы (узел: {s10.get('current_node','—')})")
+        details.append("❌ 3/4 Ликвидности по ходу движения (≤1.5%) нет")
 
-    # ── 4. S08: аномальный объём без движения (Climax) ──
-    # Критерий: есть аномалия объёма (Z-score >=2) при малом теле свечи (<30%)
-    anomalies = s8.get("volume_anomalies", [])
-    climax = [a for a in anomalies
-              if a.get("volume_zscore", 0) >= 2.0 and a.get("body_pct", 100) < 30]
-    inst = s17.get("institutional_signal", "—") if s17 else "—"
-    sign4 = bool(climax) or (anomalies and "отсутствует" in str(inst).lower())
-    signs_map["climax"] = sign4
+    # ── 4. Институциональный интерес за спиной ──
+    inst_behind = []
+    if price:
+        for pkey in ("profile_a", "profile_b"):
+            poc_item = s9.get(pkey, {}).get("POC", {})
+            if isinstance(poc_item, dict) and poc_item.get("price"):
+                inst_behind.append(("POC", poc_item["price"]))
+        for anom in (s17 or {}).get("volume_anomalies", []):
+            p = anom.get("close_price", 0)
+            if p:
+                inst_behind.append(("аномальный объём", p))
+        # За спиной = противоположная сторона от движения
+        inst_behind = [
+            (t, p) for t, p in inst_behind
+            if (p < price if move_up else p > price)
+        ]
+    sign4 = bool(inst_behind)
+    signs_map["institutional_behind"] = sign4
     if sign4:
         signs += 1
-        if climax:
-            a = climax[0]
-            details.append(
-                f"✅ S08: Climax — Z={a.get('volume_zscore',0):.1f}, "
-                f"тело {a.get('body_pct',0):.0f}% (объём без движения)"
-            )
-        else:
-            details.append(f"✅ S08: {len(anomalies)} аномалий объёма без институц. следа")
+        nearest = min(inst_behind, key=lambda x: abs(x[1] - price))
+        details.append(
+            f"✅ 4/4 Институциональная зона за спиной: {nearest[0]} {nearest[1]:.4g}"
+        )
     else:
-        details.append(f"❌ S08: Climax не зафиксирован (аномалий: {len(anomalies)})")
+        details.append("❌ 4/4 Институциональной зоны за спиной нет")
 
-    # ── 5. S04: длинные тени, ложные пробои ──
-    # Признак: S04 явно отмечает wicks/false_break/pin/hammer/shooting_star, либо S11.tail_bars за 3 бара
-    tails = s11.get("tail_bars", [])
-    recent_tails = [t for t in tails if t.get("bar_offset", 99) <= 3]
-    named_patterns = s4.get("named_patterns", []) if s4 else []
-    fake_kw = ("pin", "hammer", "shooting", "doji", "молот", "повешен", "звезда")
-    fake_bars = [p for p in named_patterns
-                 if any(kw in str(p.get("name", "")).lower() for kw in fake_kw)]
-    over_under = s11.get("over_under", s11.get("over_under_events", []))
-    sign5 = bool(recent_tails) or bool(fake_bars) or bool(over_under)
-    signs_map["wicks_false_break"] = sign5
-    if sign5:
-        signs += 1
-        parts = []
-        if recent_tails:
-            parts.append(f"хвосты: {len(recent_tails)} за 3 бара")
-        if fake_bars:
-            parts.append(f"свечные: {', '.join(p.get('name', '?') for p in fake_bars[:2])}")
-        if over_under:
-            parts.append(f"over-under: {len(over_under) if isinstance(over_under, list) else 1}")
-        details.append(f"✅ S04: длинные тени / ложные пробои — {'; '.join(parts)}")
-    else:
-        details.append("❌ S04: длинных теней и ложных пробоев за последние бары нет")
-
-    # ── 6. S05: дивергенция RSI или CVD ──
-    sign6 = bool(has_divergence)
-    signs_map["divergence"] = sign6
-    if sign6:
-        signs += 1
-        details.append("✅ S05: дивергенция RSI или CVD")
-    else:
-        details.append("❌ S05: дивергенций RSI/CVD нет")
-
-    # v8: порог — 3 из 6
+    # Правило 2: порог 3 из 4
     return {
         "is_manipulation": signs >= 3,
         "signs": signs,
-        "total": 6,
+        "total": 4,
         "threshold": 3,
         "signs_map": signs_map,
         "details": details,
@@ -1335,9 +1406,24 @@ def _build_chain(classified, price, first_step, direction, depth, is_manip,
     swing_points = swing_points or []
     counter_depth = counter_depth or depth
 
-    # ── Направление first_step = основной ход маршрута ──
+    # ── Направление основного хода маршрута ──
+    # Без манипуляции: основной ход = first_step (реальный ближайший шаг).
+    # При манипуляции (Правило 2 v4): задёрг = first_step (к ликвидности),
+    # ИМПУЛЬС = старшее направление (от институциональной зоны к целям
+    # старшего анализа) — primary строится по импульсу.
     first_dir = first_step.get("direction", "вверх")
-    go_up = (first_dir == "вверх")
+    manip_active = bool(is_manip)
+    if manip_active and direction in ("восходящий", "нисходящий"):
+        impulse_up = (direction == "восходящий")
+        jerk_up = (first_dir == "вверх")
+        if jerk_up == impulse_up:
+            # Первый шаг совпадает с импульсом — манипуляционная вставка не нужна
+            manip_active = False
+            go_up = (first_dir == "вверх")
+        else:
+            go_up = impulse_up
+    else:
+        go_up = (first_dir == "вверх")
 
     # ── Собрать все цели в единый пул с метаданными ──
     all_targets = []
@@ -1431,45 +1517,60 @@ def _build_chain(classified, price, first_step, direction, depth, is_manip,
     # ── P0: стартовая точка ──
     route = [{"price": price, "label": "P0", "status": "start", "sources": []}]
 
-    # ── Манипуляция (step_6 регламента) ──
-    # "Короткий вынос ПРОТИВ основного хода -> возврат к кромке/базе
-    #  -> продолжение по основной ветке"
-    # Основной ход = first_dir. Манипуляция = вынос ПРОТИВ first_dir.
+    # ── Манипуляция (Правило 2 Регламента v4) ──
+    # «Задёрг в сторону ликвидности → разворот → набор позиции
+    #  в институциональной зоне → импульс к целям»
+    # Задёрг = ПРОТИВ импульса (по first_step, к ближайшей ликвидности).
+    # Разворот = в институциональной зоне (POC/аномальный объём), не у P0.
     MIN_MANIP_DIST_PCT = 0.005   # мин. 0.5% расстояние для манип-цели
     MAX_MANIP_DIST_PCT = 0.03    # макс. 3%
 
-    # Манипуляция подавляется, когда первый шаг совпадает с основным трендом:
-    # если тренд нисходящий и первый шаг вниз — нет оснований для выноса вверх.
-    # Требуем >= 3 признаков манипуляции в таком случае.
-    first_aligns_trend = (
-        (direction == "нисходящий" and first_dir == "вниз") or
-        (direction == "восходящий" and first_dir == "вверх")
-    )
-    manip_threshold_met = is_manip and not first_aligns_trend
-
-    if manip_threshold_met and counter:
-        # Ищем ближайшую counter-цель в разумном диапазоне для выноса
+    if manip_active and counter:
+        # Задёрг: приоритет — ЛИКВИДНОСТЬ (стопы/FVG/тонкие зоны) против импульса
+        _liq_srcs = {"Stop", "Liquidity", "FVG", "Gap", "ThinVP"}
         manip_target = None
         for ct in counter:
             dist = abs(ct["price"] - price) / price
-            if MIN_MANIP_DIST_PCT <= dist <= MAX_MANIP_DIST_PCT:
+            if (MIN_MANIP_DIST_PCT <= dist <= MAX_MANIP_DIST_PCT
+                    and set(ct.get("sources", [])) & _liq_srcs):
                 manip_target = ct
                 break
+        if manip_target is None:
+            for ct in counter:
+                dist = abs(ct["price"] - price) / price
+                if MIN_MANIP_DIST_PCT <= dist <= MAX_MANIP_DIST_PCT:
+                    manip_target = ct
+                    break
 
         if manip_target:
-            # Шаг 1 манипуляции: вынос ПРОТИВ first_dir
+            # Шаг 1 манипуляции: задёрг к ликвидности
             route.append({
                 "price": manip_target["price"],
                 "label": "⚡вынос",
                 "status": "manip",
                 "sources": manip_target.get("sources", []),
             })
-            # Шаг 2 манипуляции: возврат к базе (~ текущая цена / P0)
+            # Шаг 2: разворот в ИНСТИТУЦИОНАЛЬНОЙ зоне — ближайший POC /
+            # аномальный объём на стороне импульса от точки задёрга
+            mt_price = manip_target["price"]
+            inst_point = None
+            inst_cands = []
+            for iz in (institutional or []):
+                izp = iz.get("price", 0)
+                if izp <= 0:
+                    continue
+                # Зона должна лежать со стороны импульса относительно задёрга
+                # и в разумной близости от текущей цены (≤2%)
+                on_impulse_side = (izp > mt_price) if go_up else (izp < mt_price)
+                if on_impulse_side and abs(izp - price) / price <= 0.02:
+                    inst_cands.append(izp)
+            if inst_cands:
+                inst_point = min(inst_cands, key=lambda p: abs(p - price))
             route.append({
-                "price": price,
-                "label": "↩возврат",
+                "price": inst_point if inst_point else price,
+                "label": "↩возврат POC" if inst_point else "↩возврат",
                 "status": "manip_return",
-                "sources": [],
+                "sources": ["POC"] if inst_point else [],
             })
 
     # ── Вспомогательная функция: найти точку отката ──

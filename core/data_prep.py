@@ -83,7 +83,26 @@ def load_csv(path: str) -> pd.DataFrame:
 
     for col in ["open", "high", "low", "close", "volume"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
-    df = df.dropna(subset=["open", "high", "low", "close", "volume"])
+
+    # Если основная "volume" вся NaN, пробуем дубликат "Volume_1"
+    if df["volume"].isna().all() and "Volume_1" in df.columns:
+        df["volume"] = pd.to_numeric(df["Volume_1"], errors="coerce")
+
+    # Volume не обязателен — заполняем NaN нулями
+    df["volume"] = df["volume"].fillna(0)
+
+    n_before = len(df)
+    nan_counts = {col: int(df[col].isna().sum()) for col in ["open", "high", "low", "close"]}
+    df = df.dropna(subset=["open", "high", "low", "close"])
+
+    if len(df) == 0:
+        diag = ", ".join(f"{c}={v}NaN/{n_before}" for c, v in nan_counts.items() if v > 0)
+        raise ValueError(
+            f"CSV загружен ({n_before} строк), но все строки отброшены — "
+            f"не удалось преобразовать OHLC в числа. "
+            f"Проблемные колонки: {diag or 'все'}. "
+            f"Файл: {path}"
+        )
 
     return df
 

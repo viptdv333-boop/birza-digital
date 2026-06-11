@@ -858,7 +858,19 @@ def _format_section_19(cons: dict) -> str:
             f"старшего тренда — потенциальный {dir_word} в направлении senior."
         )
 
-    # ─── Маршрут через route_engine по данным SENIOR ТФ ───
+    # ─── Направление сценария: Регламент v4 — СТАРШИЙ ТФ задаёт направление,
+    # младшие уточняют структуру, но не переписывают сценарий старшего.
+    # Голос Элдера используется только если старший тренд не определён.
+    if senior_dir in ("восходящий", "нисходящий"):
+        corrected_dir = senior_dir
+    elif verdict in ("bear", "weak_bear", "strong_bear"):
+        corrected_dir = "нисходящий"
+    elif verdict in ("bull", "weak_bull", "strong_bull"):
+        corrected_dir = "восходящий"
+    else:
+        corrected_dir = senior_dir
+
+    # ─── Маршрут через route_engine: цели старшего ТФ + уточнение младшими ───
     route_result = None
     if senior:
         try:
@@ -866,8 +878,46 @@ def _format_section_19(cons: dict) -> str:
                 s["section_id"]: s for s in senior.get("sections_data", [])
             }
             senior_tf_hours = senior.get("tf_hours", 4.0)
+
+            # Младшие/средние ТФ уточняют структуру маршрута (Регламент v4)
+            extra_maps = []
+            for e in per_tf:
+                if e is senior:
+                    continue
+                extra_maps.append({
+                    s["section_id"]: s for s in e.get("sections_data", [])
+                })
+
+            # k_эффект = взвешенное k по ТФ: старший 0.5, рабочий 0.3, младший 0.2
+            # (Регламент v4, раздел IV). Нормируем по присутствующим ТФ.
+            k_effect = None
+            try:
+                ordered = sorted(per_tf, key=lambda e: e.get("tf_hours", 0))  # junior → senior
+                spec_w = {1: [1.0], 2: [0.4, 0.6], 3: [0.2, 0.3, 0.5]}
+                n_tf = min(len(ordered), 3)
+                # При >3 ТФ берём младший, средний и старший
+                if len(ordered) > 3:
+                    picked = [ordered[0], ordered[len(ordered) // 2], ordered[-1]]
+                else:
+                    picked = ordered
+                ws = spec_w.get(len(picked), [1.0])
+                num, den = 0.0, 0.0
+                for e_tf, w in zip(picked, ws):
+                    s12_tf = next(
+                        (s.get("data", {}) for s in e_tf.get("sections_data", [])
+                         if s.get("section_id") == 12), {})
+                    k_val = s12_tf.get("k_tempo")
+                    if k_val and k_val > 0:
+                        num += k_val * w
+                        den += w
+                if den > 0:
+                    k_effect = num / den
+            except Exception:
+                k_effect = None
+
             route_result = build_route(
-                senior_sections_map, price, senior_dir, tf_hours=senior_tf_hours,
+                senior_sections_map, price, corrected_dir, tf_hours=senior_tf_hours,
+                k_effect=k_effect, extra_sections_maps=extra_maps,
             )
         except Exception:
             route_result = None
@@ -972,6 +1022,62 @@ def _format_section_19(cons: dict) -> str:
             lines.append(f"📌 отмена маршрута: {_format_level_cluster(slam_cluster)}")
         else:
             lines.append("📌 отмена маршрута: —")
+
+    # ── Оценка качества сигнала ──
+    score_val = 0
+    flags = []
+    is_bull = verdict in ("bull", "weak_bull", "strong_bull")
+
+    if is_bull:
+        for e in per_tf:
+            sig = e.get("signals", {})
+            if sig.get("alma_order", "").startswith("медвежий"):
+                score_val += 1
+                flags.append(f"ALMA медвежий на {e['tf']}")
+                break
+        wyck_type = ""
+        for e in per_tf:
+            for s in e.get("sections_data", []):
+                if s.get("section_id") == 10:
+                    text10 = s.get("text", "").lower()
+                    if "распределение" in text10:
+                        wyck_type = "распределение"
+                    elif "накопление" in text10:
+                        wyck_type = "накопление"
+        if wyck_type == "распределение":
+            score_val += 2
+            flags.append("Вайкофф распределение на bull")
+
+        for e in per_tf:
+            for s in e.get("sections_data", []):
+                if s.get("section_id") == 16:
+                    text16 = s.get("text", "").lower()
+                    if "отрицательный" in text16 or "отток" in text16:
+                        score_val += 2
+                        flags.append("CMF продавцы на bull")
+                        break
+            if score_val >= 2:
+                break
+
+    if score_val == 0:
+        q_verdict = "ВЫСОКОЕ (score=0)"
+        q_emoji = "V"
+    elif score_val == 1:
+        q_verdict = "СРЕДНЕЕ (score=1)"
+        q_emoji = "!"
+    else:
+        q_verdict = f"НИЗКОЕ (score={score_val}) -- рекомендуется пропустить"
+        q_emoji = "X"
+
+    lines.append("")
+    lines.append("=" * 55)
+    lines.append(f"[{q_emoji}] КАЧЕСТВО СИГНАЛА: {q_verdict}")
+    lines.append("=" * 55)
+    if flags:
+        lines.append("Факторы риска:")
+        for f in flags:
+            lines.append(f"  - {f}")
+    lines.append(f"Elder score: {score:+.2f} | Agreement: {agreement}")
 
     return "\n".join(lines)
 
