@@ -463,11 +463,8 @@ def _wrap_with_header_and_subs(body: str, meta: dict) -> str:
     exchange = meta.get("exchange", "—")
     tf = meta.get("tf", meta.get("timeframe", "—"))
     price = meta.get("price", meta.get("current_price", 0))
-    date = meta.get("date", "—")
-    if date == "—":
-        date = meta.get("period_end", "—")
-        if isinstance(date, str) and len(date) >= 16:
-            date = date[:16]
+    from datetime import datetime
+    date = datetime.now().strftime("%Y-%m-%d %H:%M")
 
     header = (
         f"📘ТИКЕР: #{ticker} (#{exchange})\n"
@@ -787,5 +784,5 @@ def make_ai_conclusion(report_id):
 if __name__ == "__main__":
     init_db()
     print("\n  Биржа-цифровой v1.0")
-    print("  http://localhost:5001\n")
-    app.run(host="0.0.0.0", port=5001, debug=True, use_reloader=False, threaded=True)
+    print("  http://localhost:5010\n")
+    app.run(host="0.0.0.0", port=5010, debug=True, use_reloader=False, threaded=True)
