@@ -27,7 +27,8 @@ def format_report(meta: dict, sections_data: list[dict],
     parts.append(f"БИРЖА: #{exchange}")
     parts.append(f"ТИП АНАЛИЗА: {analysis_type}")
     parts.append(f"ЦЕНА: {price}")
-    parts.append(f"ДАТА И ВРЕМЯ: {period_end} UTC+3")
+    from datetime import datetime
+    parts.append(f"ДАТА И ВРЕМЯ: {datetime.now().strftime('%Y-%m-%d %H:%M')} UTC+3")
     parts.append(f"❗ НЕ ЯВЛЯЕТСЯ ИИР ❗")
     parts.append("")
 
@@ -602,7 +603,8 @@ def _format_s20(meta: dict, sections_map: dict, price: float) -> str:
     lines.append(f"БИРЖА: #{exchange}")
     lines.append(f"ТИП АНАЛИЗА: {analysis_type}")
     lines.append(f"ЦЕНА: {price}")
-    lines.append(f"ДАТА И ВРЕМЯ: {period_end} UTC+3")
+    from datetime import datetime
+    lines.append(f"ДАТА И ВРЕМЯ: {datetime.now().strftime('%Y-%m-%d %H:%M')} UTC+3")
     lines.append("❗ НЕ ЯВЛЯЕТСЯ ИИР ❗")
     lines.append("")
 

@@ -43,12 +43,14 @@ def save_report(ticker, exchange, timeframe, analysis_type, ai_provider,
                 csv_filename, elapsed_sec):
     conn = get_db()
     data_clean = _clean_for_json(report_data)
+    from datetime import datetime
+    now_local = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     conn.execute("""
-        INSERT INTO reports (ticker, exchange, timeframe, analysis_type,
+        INSERT INTO reports (created_at, ticker, exchange, timeframe, analysis_type,
                             ai_provider, price, n_bars, report_text,
                             report_json, ai_response, csv_filename, elapsed_sec)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (ticker, exchange, timeframe, analysis_type, ai_provider,
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (now_local, ticker, exchange, timeframe, analysis_type, ai_provider,
           price, n_bars, report_text,
           json.dumps(data_clean, ensure_ascii=False, default=str),
           ai_response, csv_filename, elapsed_sec))

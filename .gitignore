@@ -12,3 +12,11 @@ cnyrub_output.json
 cnyrub_report.txt
 smoke_v8_out.txt
 smoke_v81_full.txt
+prices/
+backtest_results.csv
+detailed_values.txt
+full_structure.txt
+report_structure.txt
+sample_values.txt
+_commit_msg.txt
+_review_diff.txt
